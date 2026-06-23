@@ -1152,6 +1152,10 @@ class EngineCoreProc(EngineCore):
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
 
+        forward_env: dict[str, str] = kwargs.pop("forward_env", {})
+        if forward_env:
+            os.environ.update(forward_env)
+
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
 

@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -907,6 +908,56 @@ class GPUModelRunner(
             )
         self.layerwise_nvtx_hooks_registered = False
 
+        # Debug logging for persistent batch CPU overhead (VLLM_DEBUG_BATCH_CPU=1).
+        self._debug_batch_cpu = envs.VLLM_DEBUG_BATCH_CPU
+        self._batch_cpu_log_interval = max(
+            1, int(os.environ.get("VLLM_DEBUG_BATCH_CPU_INTERVAL", "10"))
+        )
+        self._batch_cpu_step = 0
+        self._continued_reqs = 0
+        self._added_reqs = 0
+        self._batch_cpu_fwd_start_event: torch.cuda.Event | None = None
+        self._batch_cpu_fwd_end_event: torch.cuda.Event | None = None
+        if self._debug_batch_cpu:
+            self._batch_cpu_fwd_start_event = torch.cuda.Event(enable_timing=True)
+            self._batch_cpu_fwd_end_event = torch.cuda.Event(enable_timing=True)
+            logger.info(
+                "[batch_cpu] debug enabled (log every %d forward steps; "
+                "fwd=GPU time via CUDA events)",
+                self._batch_cpu_log_interval,
+            )
+
+    def _reset_batch_cpu_debug_counters(self) -> None:
+        self._continued_reqs = 0
+        self._added_reqs = 0
+
+    def _maybe_log_batch_cpu_debug(
+        self,
+        prep_ms: float,
+        update_ms: float,
+        prepare_ms: float,
+        fwd_ms: float,
+    ) -> None:
+        self._batch_cpu_step += 1
+        if self._batch_cpu_step % self._batch_cpu_log_interval != 0:
+            self._reset_batch_cpu_debug_counters()
+            return
+        total = self._continued_reqs + self._added_reqs
+        continued_pct = (100.0 * self._continued_reqs / total) if total else 0.0
+        logger.info(
+            "[batch_cpu] step=%d prep=%.2fms update=%.2fms prepare=%.2fms "
+            "fwd=%.2fms continued=%d added=%d (%.0f%%)",
+            self._batch_cpu_step,
+            prep_ms,
+            update_ms,
+            prepare_ms,
+            fwd_ms,
+            self._continued_reqs,
+            self._added_reqs,
+            continued_pct,
+        )
+        self._reset_batch_cpu_debug_counters()
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         if self.speculative_config:
@@ -1397,6 +1448,9 @@ class GPUModelRunner(
                     ngram_gpu_new_reqs.append(req_state)
                 continue
 
+            if self._debug_batch_cpu:
+                self._continued_reqs += 1
+
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
@@ -1434,6 +1488,9 @@ class GPUModelRunner(
                 orig = original_num_spec_per_req.get(req_id, 0)
                 if orig != req_state.prev_num_draft_len:
                     req_state.prev_num_draft_len = orig
+
+        if self._debug_batch_cpu:
+            self._added_reqs += len(reqs_to_add)
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -4081,12 +4138,20 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        debug_batch_cpu = self._debug_batch_cpu
+        t_prep_start = time.perf_counter() if debug_batch_cpu else 0.0
+        update_ms = 0.0
+        prepare_ms = 0.0
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
+            if debug_batch_cpu:
+                t_update_start = time.perf_counter()
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if debug_batch_cpu:
+                update_ms = (time.perf_counter() - t_update_start) * 1000
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4094,6 +4159,8 @@ class GPUModelRunner(
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
                     self._execute_mm_encoder(scheduler_output)
+                    if debug_batch_cpu:
+                        self._reset_batch_cpu_debug_counters()
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
@@ -4109,6 +4176,8 @@ class GPUModelRunner(
                     # dummy run to ensure coordinate_batch_across_dp
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
+                if debug_batch_cpu:
+                    self._reset_batch_cpu_debug_counters()
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
@@ -4128,10 +4197,14 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            if debug_batch_cpu:
+                t_prepare_start = time.perf_counter()
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if debug_batch_cpu:
+                prepare_ms = (time.perf_counter() - t_prepare_start) * 1000
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4282,6 +4355,10 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+        prep_ms = 0.0
+        if debug_batch_cpu:
+            prep_ms = (time.perf_counter() - t_prep_start) * 1000
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -4320,6 +4397,9 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if debug_batch_cpu:
+                assert self._batch_cpu_fwd_start_event is not None
+                self._batch_cpu_fwd_start_event.record()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4327,6 +4407,20 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if debug_batch_cpu:
+                assert self._batch_cpu_fwd_end_event is not None
+                self._batch_cpu_fwd_end_event.record()
+
+        if debug_batch_cpu:
+            assert (
+                self._batch_cpu_fwd_start_event is not None
+                and self._batch_cpu_fwd_end_event is not None
+            )
+            self._batch_cpu_fwd_end_event.synchronize()
+            fwd_ms = self._batch_cpu_fwd_start_event.elapsed_time(
+                self._batch_cpu_fwd_end_event
+            )
+            self._maybe_log_batch_cpu_debug(prep_ms, update_ms, prepare_ms, fwd_ms)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
