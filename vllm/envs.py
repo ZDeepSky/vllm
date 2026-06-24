@@ -261,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_DEBUG_BATCH_CPU: bool = False
+    VLLM_DEBUG_BATCH_CPU_INTERVAL: int = 0
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
@@ -1851,6 +1852,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug logging for persistent batch CPU overhead in gpu_model_runner.
     "VLLM_DEBUG_BATCH_CPU": lambda: bool(
         int(os.getenv("VLLM_DEBUG_BATCH_CPU", "0"))
+    ),
+    "VLLM_DEBUG_BATCH_CPU_INTERVAL": lambda: int(
+        int(os.getenv("VLLM_DEBUG_BATCH_CPU_INTERVAL", "10"))
     ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
