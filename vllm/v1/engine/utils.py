@@ -137,12 +137,6 @@ class CoreEngineProcManager:
         tensor_queue: Queue | None = None,
     ):
         context = get_mp_context()
-        forward_env: dict[str, str] = {
-            key: value
-            for key, value in os.environ.items()
-            if key.startswith("VLLM_DEBUG_") or key == "VLLM_USE_V2_MODEL_RUNNER"
-        }
-
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -150,7 +144,6 @@ class CoreEngineProcManager:
             "executor_class": executor_class,
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
-            "forward_env": forward_env,
         }
 
         if client_handshake_address:
