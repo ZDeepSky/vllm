@@ -78,6 +78,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm_scheduler_observer import StatusExporter, collect
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -235,6 +236,17 @@ class EngineCore:
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
+
+        self._scheduler_observer = StatusExporter()
+        self._scheduler_observer.start()
+
+    def _observe_scheduler(self) -> None:
+        logger.info(
+            "[OBS] step begin, running=%d waiting=%d",
+            len(self.scheduler.running),
+            len(self.scheduler.waiting),
+        )
+        self._scheduler_observer.update(collect(self.scheduler))
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -482,6 +494,7 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        self._observe_scheduler()
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -532,6 +545,8 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
+
+        self._observe_scheduler()
 
         batch_queue = self.batch_queue
         assert batch_queue is not None

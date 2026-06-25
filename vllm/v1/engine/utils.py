@@ -137,6 +137,7 @@ class CoreEngineProcManager:
         tensor_queue: Queue | None = None,
     ):
         context = get_mp_context()
+
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
