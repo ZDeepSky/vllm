@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -116,10 +117,27 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        if envs.VLLM_DEBUG_BLOCK_TABLE:
+            from vllm.v1.worker.block_table_debug import get_block_table_debug
+
+            get_block_table_debug().record_append(row_idx)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
+        if not block_ids:
+            self.num_blocks_per_row[row_idx] = 0
+            return
+        if self.use_hybrid_blocks:
+            block_ids = self.map_to_kernel_blocks(
+                np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange
+            )
         self.num_blocks_per_row[row_idx] = 0
-        self.append_row(block_ids, row_idx)
+        num_blocks = len(block_ids)
+        self.num_blocks_per_row[row_idx] = num_blocks
+        self.block_table.np[row_idx, :num_blocks] = block_ids
+        if envs.VLLM_DEBUG_BLOCK_TABLE:
+            from vllm.v1.worker.block_table_debug import get_block_table_debug
+
+            get_block_table_debug().record_add(row_idx)
 
     def clear_row(self, row_idx: int) -> None:
         num_blocks = self.num_blocks_per_row[row_idx]

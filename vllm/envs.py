@@ -262,6 +262,9 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_DEBUG_BATCH_CPU: bool = False
     VLLM_DEBUG_BATCH_CPU_INTERVAL: int = 0
+    VLLM_DEBUG_BLOCK_TABLE: bool = False
+    VLLM_DEBUG_BLOCK_TABLE_DUMP_DIR: str | None = None
+    VLLM_DEBUG_BLOCK_TABLE_ABORT: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
@@ -1855,6 +1858,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEBUG_BATCH_CPU_INTERVAL": lambda: int(
         int(os.getenv("VLLM_DEBUG_BATCH_CPU_INTERVAL", "10"))
+    ),
+    # Trace block table append_row / add_row dual-path invariant in worker.
+    "VLLM_DEBUG_BLOCK_TABLE": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_BLOCK_TABLE", "0"))
+    ),
+    "VLLM_DEBUG_BLOCK_TABLE_DUMP_DIR": lambda: os.environ.get(
+        "VLLM_DEBUG_BLOCK_TABLE_DUMP_DIR", None
+    ),
+    "VLLM_DEBUG_BLOCK_TABLE_ABORT": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_BLOCK_TABLE_ABORT", "0"))
     ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(

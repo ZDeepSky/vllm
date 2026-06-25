@@ -1196,6 +1196,11 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if envs.VLLM_DEBUG_BLOCK_TABLE:
+            from vllm.v1.worker.block_table_debug import get_block_table_debug
+
+            get_block_table_debug().begin_update_states(scheduler_output)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1460,6 +1465,10 @@ class GPUModelRunner(
                 continue
 
             self.opt_batch_cpu("continued")
+            if envs.VLLM_DEBUG_BLOCK_TABLE:
+                from vllm.v1.worker.block_table_debug import get_block_table_debug
+
+                get_block_table_debug().note_continued(req_id, req_index)
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
@@ -1504,7 +1513,11 @@ class GPUModelRunner(
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
-            self.input_batch.add_request(request)
+            req_index = self.input_batch.add_request(request)
+            if envs.VLLM_DEBUG_BLOCK_TABLE:
+                from vllm.v1.worker.block_table_debug import get_block_table_debug
+
+                get_block_table_debug().note_added(request.req_id, req_index)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
 
         # Condense the batched states if there are gaps left by removed requests
@@ -1525,6 +1538,11 @@ class GPUModelRunner(
                 _pinned_idx_buf=self._ngram_pinned_idx_buf,
                 _pinned_val_buf=self._ngram_pinned_val_buf,
             )
+
+        if envs.VLLM_DEBUG_BLOCK_TABLE:
+            from vllm.v1.worker.block_table_debug import get_block_table_debug
+
+            get_block_table_debug().end_update_states(self)
 
         if deferred_spec_decode_corrections:
 

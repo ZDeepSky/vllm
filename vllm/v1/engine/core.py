@@ -78,7 +78,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
-from vllm_scheduler_observer import StatusExporter, collect
+from vllm_scheduler_observer import StatusExporter, collect, collect_scheduler_output
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -240,13 +240,22 @@ class EngineCore:
         self._scheduler_observer = StatusExporter()
         self._scheduler_observer.start()
 
-    def _observe_scheduler(self) -> None:
+    def _observe_scheduler(self, scheduler_output=None) -> None:
+        stats = collect(self.scheduler)
+        if scheduler_output is not None:
+            stats.update(collect_scheduler_output(scheduler_output))
+            dual = stats.get("scheduler_dual_listed_req_ids") or []
+            if dual:
+                logger.warning(
+                    "[OBS] scheduler dual-listed req_ids=%s (block table risk)",
+                    dual,
+                )
         logger.info(
             "[OBS] step begin, running=%d waiting=%d",
             len(self.scheduler.running),
             len(self.scheduler.waiting),
         )
-        self._scheduler_observer.update(collect(self.scheduler))
+        self._scheduler_observer.update(stats)
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
@@ -501,6 +510,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        self._observe_scheduler(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -560,6 +570,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            self._observe_scheduler(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
