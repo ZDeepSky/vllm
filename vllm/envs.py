@@ -286,6 +286,8 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_TIPC_SERVER_NUM: int = 0
+
 
 
 def get_default_cache_root():
@@ -1955,6 +1957,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    "VLLM_TIPC_SERVER_NUM": lambda: int(os.getenv("VLLM_TIPC_SERVER_NUM", "0")),
 }
 
 

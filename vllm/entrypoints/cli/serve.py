@@ -27,6 +27,7 @@ from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 from vllm.v1.utils import (
     APIServerProcessManager,
     RustFrontendProcessManager,
+    TipcProcessManager,
     wait_for_completion_or_failure,
 )
 
@@ -140,7 +141,7 @@ class ServeSubcommand(CLISubcommand):
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
             run_headless(args)
-        elif args.api_server_count > 1 or envs.VLLM_RUST_FRONTEND_PATH:
+        elif args.api_server_count > 1 or envs.VLLM_RUST_FRONTEND_PATH or envs.VLLM_TIPC_SERVER_NUM > 0:
             run_multi_api_server(args)
         else:
             # Single API server (this process).
@@ -259,10 +260,18 @@ def run_multi_api_server(args: argparse.Namespace):
     rust_frontend_path = envs.VLLM_RUST_FRONTEND_PATH
     num_api_servers: int = args.api_server_count
     assert num_api_servers > 0
+    num_tipc_servers: int = envs.VLLM_TIPC_SERVER_NUM
+    num_frontends = num_api_servers + num_tipc_servers
 
     if rust_frontend_path and num_api_servers > 1:
         raise ValueError(
             "VLLM_RUST_FRONTEND_PATH does not support api_server_count > 1"
+        )
+
+    if rust_frontend_path and num_tipc_servers > 0:
+        raise ValueError(
+            "VLLM_RUST_FRONTEND_PATH cannot be used together with "
+            "VLLM_TIPC_SERVER_NUM"
         )
 
     if num_api_servers > 1:
@@ -284,7 +293,7 @@ def run_multi_api_server(args: argparse.Namespace):
     listen_address, sock = setup_server(args)
 
     engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
-    engine_args._api_process_count = num_api_servers
+    engine_args._api_process_count = num_frontends
     engine_args._api_process_rank = -1
 
     usage_context = UsageContext.OPENAI_API_SERVER
@@ -305,6 +314,7 @@ def run_multi_api_server(args: argparse.Namespace):
     api_server_manager: APIServerProcessManager | RustFrontendProcessManager | None = (
         None
     )
+    tipc_server_manager: TipcProcessManager | None = None
 
     from vllm.v1.engine.utils import get_engine_zmq_addresses
 
@@ -316,12 +326,21 @@ def run_multi_api_server(args: argparse.Namespace):
     is_ray_dp = parallel_config.data_parallel_backend == "ray"
     addresses = get_engine_zmq_addresses(
         vllm_config,
-        num_api_servers,
+        num_frontends,
         defer_api_server_ports=not (rust_frontend_path or is_ray_dp),
     )
 
+    if num_tipc_servers > 0:
+        logger.info(
+            "Tipc frontends enabled: num_api_servers=%d num_tipc_servers=%d "
+            "num_frontends=%d",
+            num_api_servers,
+            num_tipc_servers,
+            num_frontends,
+        )
+
     with launch_core_engines(
-        vllm_config, executor_class, log_stats, addresses, num_api_servers
+        vllm_config, executor_class, log_stats, addresses, num_frontends
     ) as (local_engine_manager, coordinator, addresses, tensor_queue):
         stats_update_address = (
             coordinator.get_stats_publish_address() if coordinator else None
@@ -346,17 +365,29 @@ def run_multi_api_server(args: argparse.Namespace):
                 stats_update_address=stats_update_address,
             )
         else:
-            # Start API server(s).
+            # Start API server(s). Tipc slots use addresses[num_api_servers:].
             api_server_manager = APIServerProcessManager(
                 listen_address=listen_address,
                 sock=sock,
                 args=args,
                 num_servers=num_api_servers,
-                input_addresses=addresses.inputs,
-                output_addresses=addresses.outputs,
+                input_addresses=addresses.inputs[:num_api_servers],
+                output_addresses=addresses.outputs[:num_api_servers],
                 stats_update_address=stats_update_address,
                 tensor_queue=tensor_queue,
             )
+
+            if num_tipc_servers > 0:
+                tipc_server_manager = TipcProcessManager(
+                    args=args,
+                    num_servers=num_tipc_servers,
+                    input_addresses=addresses.inputs[num_api_servers:],
+                    output_addresses=addresses.outputs[num_api_servers:],
+                    client_index_base=num_api_servers,
+                    tipc_type=envs.VLLM_TIPC_TYPE,
+                    tipc_instance_base=envs.VLLM_TIPC_INSTANCE_BASE,
+                    stats_update_address=stats_update_address,
+                )
 
             if not is_ray_dp:
                 # Forward each child's bound endpoints to the engine handshake
@@ -368,12 +399,13 @@ def run_multi_api_server(args: argparse.Namespace):
                 addresses.inputs = actual_inputs
                 addresses.outputs = actual_outputs
 
-    # Wait for API servers.
+    # Wait for API / Tipc servers.
     try:
         wait_for_completion_or_failure(
             api_server_manager=api_server_manager,
             engine_manager=local_engine_manager,
             coordinator=coordinator,
+            tipc_server_manager=tipc_server_manager,
         )
     finally:
         timeout = shutdown_by = None
@@ -388,6 +420,8 @@ def run_multi_api_server(args: argparse.Namespace):
             )
 
         api_server_manager.shutdown(timeout=timeout)
+        if tipc_server_manager is not None:
+            tipc_server_manager.shutdown(timeout=to_timeout(shutdown_by))
         if local_engine_manager:
             local_engine_manager.shutdown(timeout=to_timeout(shutdown_by))
         if coordinator:

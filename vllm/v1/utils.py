@@ -513,6 +513,7 @@ def wait_for_completion_or_failure(
     engine_manager: Union["CoreEngineProcManager", "CoreEngineActorManager"]
     | None = None,
     coordinator: "DPCoordinator | None" = None,
+    tipc_server_manager: "TipcProcessManager | None" = None,
 ) -> None:
     """Wait for all processes to complete or detect if any fail.
 
@@ -524,6 +525,7 @@ def wait_for_completion_or_failure(
             If CoreEngineProcManager, it manages local engines;
             if CoreEngineActorManager, it manages all engines.
         coordinator: The coordinator for data parallel.
+        tipc_server_manager: Optional manager for Tipc frontend processes.
     """
 
     try:
@@ -811,3 +813,99 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         num_generation_requests,
         num_generation_tokens,
     )
+
+
+class TipcProcessManager:
+    """Manages a group of Tipc frontend processes.
+
+    Mirrors :class:`APIServerProcessManager`: each child binds one ZMQ
+    frontend slot and reports the actual endpoint via ``actual_address_pipe``.
+    Does not own an HTTP listen socket.
+    """
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        num_servers: int,
+        input_addresses: list[str],
+        output_addresses: list[str],
+        client_index_base: int,
+        tipc_type: int,
+        tipc_instance_base: int,
+        stats_update_address: str | None = None,
+        client_count: int | None = None,
+    ):
+        """Initialize and start Tipc server worker processes.
+
+        ``input_addresses``/``output_addresses`` may contain
+        ``tcp://host:0`` placeholders; each child must report the actual
+        bound endpoint over its ``actual_address_pipe`` in ``client_config``
+        and the parent collects them via
+        :py:meth:`gather_actual_addresses`.
+
+        Args:
+            args: Command line arguments
+            num_servers: Number of Tipc server processes to start
+            input_addresses: Input addresses for each Tipc server
+            output_addresses: Output addresses for each Tipc server
+            client_index_base: Global frontend index of the first Tipc server
+            tipc_type: AF_TIPC service type
+            tipc_instance_base: AF_TIPC instance for the first Tipc server
+            stats_update_address: Optional stats update address
+            client_count: Total frontend count shared with EngineCore
+                (defaults to ``client_index_base + num_servers``)
+        """
+        self.args = args
+        if client_count is None:
+            client_count = client_index_base + num_servers
+
+        spawn_context = multiprocessing.get_context("spawn")
+        self.processes: list[BaseProcess] = []
+        self._address_pipes: list[connection.Connection] = []
+
+        from vllm.entrypoints.tipc_server import run_tipc_server_worker_proc
+
+        for local_i, in_addr, out_addr in zip(
+            range(num_servers), input_addresses, output_addresses
+        ):
+            client_index = client_index_base + local_i
+            client_config: dict[str, Any] = {
+                "input_address": in_addr,
+                "output_address": out_addr,
+                "client_count": client_count,
+                "client_index": client_index,
+                "tipc_type": tipc_type,
+                "tipc_instance": tipc_instance_base + local_i,
+            }
+            if stats_update_address is not None:
+                client_config["stats_update_address"] = stats_update_address
+
+            parent_recv, child_send = spawn_context.Pipe(duplex=False)
+            self._address_pipes.append(parent_recv)
+            client_config["actual_address_pipe"] = child_send
+
+            proc = spawn_context.Process(
+                target=run_tipc_server_worker_proc,
+                name=f"TipcServer_{client_index}",
+                args=(args, client_config),
+            )
+            self.processes.append(proc)
+            proc.start()
+
+            # Drop parent's write end so reader sees EOF on child death.
+            child_send.close()
+
+        logger.info("Started %d Tipc server processes", len(self.processes))
+
+        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Shutdown Tipc server processes with configurable timeout."""
+        for pipe in self._address_pipes:
+            with contextlib.suppress(Exception):
+                pipe.close()
+        self._address_pipes = []
+
+        if self._finalizer.detach() is not None:
+            shutdown(self.processes, timeout=timeout)
